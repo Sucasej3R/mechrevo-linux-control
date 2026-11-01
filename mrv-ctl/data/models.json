@@ -6,5 +6,13 @@
     "verified": {"bios": "N.1.16MRO13", "date": "2026-09-25", "data": "docs/perf/4-final.jsonl"},
     "cpu_ppt_w": {"office": 45, "balanced": 87, "boost": 130},
     "notes": "CPU 功耗墙为 openssl 32 进程满载稳态; 狂暴档 45 秒稳态受 97°C 温度墙限制约 123 W"
+  },
+  {
+    "id": "mechrevo-canglong-16xpro",
+    "name": "机械革命 苍龙 16X Pro (R9 9955HX + RTX 5070 Ti)",
+    "match": {"vendor": "MECHREVO", "cpu_contains": "9955HX"},
+    "verified": {"date": "2026-11-01"},
+    "cpu_ppt_w": {"office": 45, "balanced": 85, "boost": 115},
+    "notes": "R9 9955HX 满载稳态; 狂暴档受 97°C 温度墙限制稳态约 105-120 W"
   }
 ]

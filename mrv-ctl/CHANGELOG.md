@@ -1,5 +1,15 @@
 # 变更记录
 
+## 3.5.0 — 2026-11-01 · 苍龙 16X Pro 适配与 Arch / Wayland 修复
+
+- 新增 ITE 8291 (`048d:600b`) USB HID 键盘灯驱动（`/dev/hidraw*`），支持单色、彩虹、亮度调节与关灯；无该芯片时回退 `uniwill_laptop` sysfs
+- 新增机型档案：机械革命 苍龙 16X Pro（R9 9955HX + RTX 5070 Ti）；修复 `/opt/mrv/models.json` 路径读取
+- 修复 `mrv-gui` 中 `_send()` 调用 `GLib.idle_add(self.refresh)` 导致点击按钮后单核 100% CPU 死循环的问题
+- `mrv-gui` 默认使用 `GDK_BACKEND=x11`，去除 KDE Wayland 下的原生外层窗口边框；新增单实例唤醒（`/run/user/<uid>/mrv-gui.sock`）
+- 状态持久化补齐：开机与睡眠唤醒后恢复档位、充电阈值、键盘灯及全部 4 项 INOU 平台开关；关闭背光时保留上次非零亮度
+- 修复离电自动关灯 (`AcLedGuard`) 在 ITE 8291 上的支持，以及离电时 EC `0x0751` 返回 `0x20` 被误判为 `custom(0x20)` 的问题
+- 控制页开放 `touchpad_toggle_enable`（触控板开关）；修复滑条滚轮/点击防抖与切档后 GPU 功耗上限刷新延迟
+
 ## 3.4.3 — 2026-09-25 · 多机型适配
 
 - 新增机型适配层 `mrvmodel.py` + `data/models.json`：识别 DMI / BIOS / EC 平台代际 / CPU / GPU PCI ID，匹配已验证机型档案；按 DSDT 方法与 EC 可读性决定各功能是否开放，并给出原因

@@ -197,12 +197,15 @@ def get_profile():
     if v is None:
         return "unknown"
     bits = v & PROFILE_CLEAR
-    return {0xA0: "office", 0x10: "boost", 0x00: "balanced"}.get(
+    # 离电状态下 EC 固件可能清除 bit7 (0x80) 仅保留 bit5 (0x20), 同属静音/节能态
+    return {0xA0: "office", 0x80: "office", 0x20: "office", 0x10: "boost", 0x00: "balanced"}.get(
         bits, f"custom(0x{v:02X})")
 
 
-# 档位联动: 功耗墙由 EC 固件随档位位切换; 这里附带 CPU EPP / 睿频与灯效.
-# EPP 不影响满载功耗 (A/B 实测); 静音档关睿频让轻负载下空闲功耗 46 -> 39.5 W (后台 ToDesk 编码时实测)
+# 档位联动:
+# 1. 硬件功耗墙、风扇曲线、GPU Dynamic Boost 由 EC 0x0751 硬件直接切换;
+# 2. 静音档 (office) 关闭 CPU 睿频 (锁 2.5GHz 基频 + EPP=power), 避免 9955HX 单核冲 5.25GHz 局部积热触发风扇提速;
+# 3. 平衡档 (balanced) 与狂暴档 (boost) 开启满血睿频 (cpu_boost=True), 配合 BIOS PBO 负压发挥最佳能效与性能
 PROFILE_ACTIONS = {
     "office": {"epp": "power", "cpu_boost": False, "kbd_brightness": 30, "kbd_rainbow": False},
     "balanced": {"epp": "balance_performance", "cpu_boost": True, "kbd_brightness": 80, "kbd_rainbow": False},
@@ -239,7 +242,7 @@ def apply_epp(value: str) -> bool:
 
 
 def apply_profile_actions(name: str, kbd=True):
-    """应用档位联动 (CPU/灯效); kbd=False 时不动键盘灯, 保留用户手动调过的亮度"""
+    """应用原厂档位联动 (EPP 能效倾向 + 保持睿频开启 + 可选灯效); kbd=False 时保留用户当前键盘灯设置"""
     act = PROFILE_ACTIONS.get(name)
     if not act:
         return
@@ -250,7 +253,7 @@ def apply_profile_actions(name: str, kbd=True):
     if kbd:
         kbd_set(brightness=act.get("kbd_brightness", 0),
                 effect=("rainbow" if act.get("kbd_rainbow") else "solid"))
-    log(f"档位联动已应用: {name} (EPP={act.get('epp')}, 睿频={'开' if act.get('cpu_boost', True) else '关'})")
+    log(f"档位联动已应用 (原厂策略): {name} (EPP={act.get('epp')}, 睿频={'开' if act.get('cpu_boost', True) else '关'})")
 
 
 # set_profile 与物理键轮询共享"最近一次已联动的档位", 避免同一次切换联动两遍;
@@ -259,8 +262,16 @@ _profile_lock = threading.RLock()
 _profile_seen = None
 
 
-def set_profile(name, link=True, kbd=True):
-    """link=False: 只切 EC 档位位, 不做任何联动 (校准用); kbd=False: 联动 CPU 但不动键盘灯 (开机恢复用)"""
+def _invalidate_gpu_limits():
+    _gpu_limits["t"] = 0.0
+    def _delayed():
+        time.sleep(1.2)
+        _gpu_limits["t"] = 0.0
+    threading.Thread(target=_delayed, daemon=True).start()
+
+
+def set_profile(name, link=True, kbd=False):
+    """link=False: 只切 EC 档位位, 不做任何联动 (校准用); kbd=False: 联动 CPU 但不动键盘灯 (保留用户键盘灯设置)"""
     global _profile_seen
     if name not in PROFILE_BITS:
         return {"ok": False, "error": f"未知档位 {name}"}
@@ -274,24 +285,50 @@ def set_profile(name, link=True, kbd=True):
         if ok:
             _profile_seen = name
             state_update(profile=name)
+            _invalidate_gpu_limits()
             if link:
                 apply_profile_actions(name, kbd=kbd)
     log(f"性能模式 -> {name}: {'OK' if ok else 'FAIL'}")
     return {"ok": ok, "profile": name if ok else None}
 
 
+def _boottime_gap():
+    try:
+        return time.clock_gettime(time.CLOCK_BOOTTIME) - time.clock_gettime(time.CLOCK_MONOTONIC)
+    except Exception:
+        return 0.0
+
+
 def profile_watch_loop():
-    """物理键检测: 固件自行切换 EC 档位而不通知 Linux, 这里轮询感知并联动"""
+    """物理键检测 + 系统睡眠唤醒 (Suspend/Resume) 状态自动恢复"""
     global _profile_seen
+    last_gap = _boottime_gap()
     while True:
         try:
+            cur_gap = _boottime_gap()
+            if cur_gap - last_gap > 2.0:
+                log(f"检测到系统睡眠唤醒 (休眠时长 ≈{cur_gap - last_gap:.0f}s), 正在恢复硬件状态...")
+                last_gap = cur_gap
+                time.sleep(2)
+                st = load_state()
+                prof = st.get("profile")
+                if prof in PROFILE_BITS:
+                    set_profile(prof, kbd=False)
+                _restore_extras()
+                if ac_led_guard:
+                    ac_led_guard.last_ac = None
+                    ac_led_guard.poll()
+            else:
+                last_gap = cur_gap
+
             with _profile_lock:
                 cur = get_profile()
                 if cur != _profile_seen:
                     if _profile_seen is not None and cur in PROFILE_BITS:
                         log(f"检测到档位变化 {_profile_seen} -> {cur} (物理键/外部), 应用联动")
                         state_update(profile=cur)
-                        apply_profile_actions(cur)
+                        _invalidate_gpu_limits()
+                        apply_profile_actions(cur, kbd=False)
                     _profile_seen = cur
         except Exception as e:
             log(f"WARN profile watch: {e}")
@@ -407,7 +444,82 @@ class ThermalGuard(threading.Thread):
                 log("退出: 撤销自动强冷")
 
 
-# ================================================================ RGB 灯效
+# ================================================================ RGB 灯效 (ITE 8291 USB HID + EC 兼容)
+HIDIOCSFEATURE_8 = 0xC0084806  # _IOC(_IOC_WRITE|_IOC_READ, 'H', 0x06, 8)
+_ite_lock = threading.Lock()
+_kbd_live = {"effect": "solid", "brightness": 80, "rgb": [120, 200, 160]}
+
+RAINBOW_PALETTE = (
+    (255, 0, 0),
+    (255, 127, 0),
+    (255, 255, 0),
+    (0, 255, 0),
+    (0, 255, 255),
+    (0, 80, 255),
+    (180, 0, 255),
+)
+
+
+def find_ite8291():
+    """查找 ITE 8291 (048D:600B / 6004 / 600A / CE00) USB RGB 键盘控制器的 hidraw 设备与 sysfs 目录"""
+    for p in sorted(_glob.glob("/sys/bus/hid/devices/*048D:*")):
+        hids = sorted(_glob.glob(f"{p}/hidraw/hidraw*"))
+        if hids:
+            dev = f"/dev/{os.path.basename(hids[0])}"
+            if os.path.exists(dev):
+                return dev, p
+    return None, None
+
+
+def ite8291_apply(effect: str, brightness: int, rgb: list) -> bool:
+    dev, sysfs_dir = find_ite8291()
+    if not dev:
+        return False
+    buf_ctrl = f"{sysfs_dir}/controls/buffer_input" if sysfs_dir else None
+    if buf_ctrl and os.path.exists(buf_ctrl):
+        try:
+            with open(buf_ctrl, "w") as f:
+                f.write("1")
+        except OSError:
+            pass
+
+    br200 = max(0, min(int(brightness), PWM_MAX))
+    br50 = 0 if (effect == "off" or br200 == 0) else max(1, min(50, round(br200 * 50 / PWM_MAX)))
+    if sysfs_dir and os.path.exists(f"{sysfs_dir}/leds/rgb:kbd_backlight/brightness"):
+        try:
+            with open(f"{sysfs_dir}/leds/rgb:kbd_backlight/brightness", "w") as f:
+                f.write(str(br50))
+        except OSError:
+            pass
+    r200, g200, b200 = (max(0, min(int(x), PWM_MAX)) for x in (rgb or (120, 200, 160))[:3])
+    r255 = round(r200 * 255 / PWM_MAX)
+    g255 = round(g200 * 255 / PWM_MAX)
+    b255 = round(b200 * 255 / PWM_MAX)
+
+    def send_ctrl(fd, pkt):
+        buf = bytearray(pkt)
+        fcntl.ioctl(fd, HIDIOCSFEATURE_8, buf)
+
+    with _ite_lock:
+        fd = os.open(dev, os.O_RDWR)
+        try:
+            if effect == "off" or br50 == 0:
+                send_ctrl(fd, [0x08, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+            elif effect == "rainbow":
+                for idx, (pr, pg, pb) in enumerate(RAINBOW_PALETTE, start=1):
+                    send_ctrl(fd, [0x14, 0x00, idx, pr, pg, pb, 0x00, 0x00])
+                send_ctrl(fd, [0x08, 0x02, 0x03, 0x05, br50, 0x08, 0x01, 0x00])
+            else:
+                send_ctrl(fd, [0x08, 0x02, 0x33, 0x00, br50, 0x00, 0x00, 0x00])
+                row_pkt = bytes([0x00, 0x00]) + bytes([b255] * 21) + bytes([g255] * 21) + bytes([r255] * 21)
+                for row in range(6):
+                    send_ctrl(fd, [0x16, 0x00, row, 0x00, 0x00, 0x00, 0x00, 0x00])
+                    os.write(fd, row_pkt)
+        finally:
+            os.close(fd)
+    return True
+
+
 def led_write(name, value):
     try:
         with open(f"{LED_DIR}/{name}", "w") as f:
@@ -418,53 +530,80 @@ def led_write(name, value):
         return False
 
 
-def kbd_set(brightness=None, rgb=None, effect=None) -> dict:
-    out = {"ok": True}
-    inou = INOU_DIR
+def kbd_set(brightness=None, rgb=None, effect=None, persist=True) -> dict:
+    st = load_state()
+    cur_eff = st.get("kbd_effect") or _kbd_live["effect"] or "solid"
+    cur_br = st.get("kbd_brightness") if st.get("kbd_brightness") is not None else _kbd_live["brightness"]
+    cur_rgb = st.get("kbd_rgb") or _kbd_live["rgb"] or [120, 200, 160]
+
+    target_rgb = [max(0, min(int(x), PWM_MAX)) for x in rgb[:3]] if rgb is not None else list(cur_rgb)
     if effect is not None:
-        # effect: solid=单色(关闭固件彩虹) rainbow=流畅彩虹 off=全灭
-        p = f"{inou}/rainbow_animation"
-        if not os.path.exists(p):
-            out["ok"], out["error"] = False, "固件不支持彩虹动画"
+        target_eff = effect
+    elif brightness is not None:
+        if int(brightness) == 0:
+            target_eff = "off"
+        elif cur_eff == "off":
+            target_eff = "solid"
         else:
-            if effect == "rainbow":
-                with open(p, "w") as f:
-                    f.write("1")
-                out["effect"] = "rainbow"
-            elif effect == "solid":
-                with open(p, "w") as f:
-                    f.write("0")
-                out["effect"] = "solid"
-            elif effect == "off":
-                with open(p, "w") as f:
-                    f.write("0")
-                if led_write("brightness", "0"):
-                    out["effect"] = "off"
-                else:
-                    out["ok"] = False
-    if rgb is not None:
-        if effect != "rainbow":          # 彩虹模式下固件接管颜色, 写了会闪回
-            r, g, b = (max(0, min(int(x), PWM_MAX)) for x in rgb)
-            if led_write("multi_intensity", f"{r} {g} {b}"):
-                out["rgb"] = [r, g, b]
-            else:
-                out["ok"] = False
+            target_eff = cur_eff
+    else:
+        target_eff = cur_eff if cur_eff != "off" else "solid"
+
     if brightness is not None:
+        target_br = max(0, min(int(brightness), PWM_MAX))
+    elif target_eff == "off":
+        target_br = 0
+    else:
+        target_br = int(cur_br) if int(cur_br or 0) > 0 else 100
+
+    if target_br == 0:
+        target_eff = "off"
+
+    out = {"ok": True, "effect": target_eff, "brightness": target_br, "max": PWM_MAX, "rgb": target_rgb}
+
+    # 1. 优先驱动 ITE 8291 (048D:600B) USB 逐键 RGB 控制器
+    ite_dev, _ = find_ite8291()
+    if ite_dev:
         try:
-            with open(f"{LED_DIR}/max_brightness") as f:
-                mx = int(f.read().strip())
-            v = max(0, min(int(brightness), mx))
-            if led_write("brightness", str(v)):
-                out["brightness"] = v
-                out["max"] = mx
-            else:
-                out["ok"] = False
-        except OSError as e:
+            ite8291_apply(target_eff, target_br, target_rgb)
+        except Exception as e:
+            log(f"WARN ITE8291 写入失败: {e}")
             out["ok"], out["error"] = False, str(e)
+
+    # 2. 同步写入 EC / uniwill sysfs (兼容单区机型及状态查询)
+    inou = INOU_DIR
+    p_rain = f"{inou}/rainbow_animation"
+    if os.path.exists(p_rain):
+        try:
+            with open(p_rain, "w") as f:
+                f.write("1" if target_eff == "rainbow" else "0")
+        except OSError:
+            pass
+    if os.path.exists(f"{LED_DIR}/multi_intensity") and target_eff != "rainbow":
+        led_write("multi_intensity", f"{target_rgb[0]} {target_rgb[1]} {target_rgb[2]}")
+    if os.path.exists(f"{LED_DIR}/brightness"):
+        led_write("brightness", str(target_br))
+
+    _kbd_live.update(effect=target_eff, brightness=target_br, rgb=target_rgb)
+
+    # 3. 持久化键盘灯状态 (重启自动恢复; 关灯或滑到 0 时保留上一次非零亮度以便后续开灯恢复)
+    if persist and out.get("ok"):
+        kv = {
+            "kbd_rgb": target_rgb,
+            "kbd_effect": target_eff,
+        }
+        if target_br > 0 and target_eff != "off":
+            kv["kbd_brightness"] = target_br
+            kv["kbd_restore"] = target_br
+        try:
+            state_update(**kv)
+        except Exception as e:
+            log(f"WARN kbd persist: {e}")
+
     return out
 
 
-def toggle_sysfs(name: str, enable: bool) -> dict:
+def toggle_sysfs(name: str, enable: bool, persist: bool = True) -> dict:
     """INOU 平台小开关 (fn_lock/super_key/breathing 等)"""
     if name not in TOGGLES:
         return {"ok": False, "error": f"不允许的开关 {name}"}
@@ -474,6 +613,13 @@ def toggle_sysfs(name: str, enable: bool) -> dict:
     try:
         with open(p, "w") as f:
             f.write("1" if enable else "0")
+        if persist:
+            with _state_lock:
+                st = load_state()
+                toggles = dict(st.get("toggles") or {})
+                toggles[name] = bool(enable)
+                st["toggles"] = toggles
+                save_state(st)
         return {"ok": True, name: enable}
     except OSError as e:
         return {"ok": False, "error": str(e)}
@@ -515,11 +661,12 @@ def probe_features(dsdt: dict) -> dict:
         "profile": gates["profile"]["ok"],
         "charge": gates["charge"]["ok"],
         "fan": bool(HW),
-        "rgb": os.path.exists(f"{LED_DIR}/multi_intensity"),
-        "rainbow": os.path.exists(f"{inou}/rainbow_animation"),
+        "rgb": bool(find_ite8291()[0]) or os.path.exists(f"{LED_DIR}/multi_intensity"),
+        "rainbow": bool(find_ite8291()[0]) or os.path.exists(f"{inou}/rainbow_animation"),
         "breathing": os.path.exists(f"{inou}/breathing_in_suspend"),
         "fn_lock": os.path.exists(f"{inou}/fn_lock"),
         "super_key": os.path.exists(f"{inou}/super_key_enable"),
+        "touchpad_toggle": os.path.exists(f"{inou}/touchpad_toggle_enable"),
         "logo_light": False,       # lightbar 寄存器需实测, 默认隐藏
         "fan_boost": gates["fan_boost"]["ok"],
         "ec_channel": "wkbc" if EC_VIA_WKBC else "mmio",
@@ -539,10 +686,27 @@ def probe_features(dsdt: dict) -> dict:
 
 # ================================================================ 离电关灯
 class AcLedGuard:
-    """可选: 拔电自动关背光, 插电恢复"""
+    """可选: 拔电自动关背光, 插电恢复 (兼容 ITE 8291 USB 控制器与 uniwill_keyboard 插拔钩子)"""
     def __init__(self):
         self.enabled = load_state().get("ac_led_off", False)
         self.last_ac = None
+
+    def _turn_off_for_battery(self, tag: str):
+        cur_br = _kbd_live.get("brightness", 0)
+        if isinstance(cur_br, int) and cur_br > 0:
+            state_update(kbd_restore=cur_br)
+        kbd_set(effect="off", brightness=0, persist=False)
+        log(f"{tag}: 关闭背光")
+
+    def _restore_for_ac(self):
+        time.sleep(0.6)  # 避开内核 tuxedo_keyboard 在插拔电源时的 LED 重置钩子
+        st = load_state()
+        eff = st.get("kbd_effect") or "solid"
+        if eff != "off":
+            restore_br = st.get("kbd_brightness") or st.get("kbd_restore") or 100
+            restore_rgb = st.get("kbd_rgb") or _kbd_live.get("rgb") or [120, 200, 160]
+            kbd_set(effect=eff, brightness=restore_br, rgb=restore_rgb, persist=False)
+            log(f"插电: 恢复背光 ({eff}, 亮度={restore_br})")
 
     def poll(self):
         if not self.enabled:
@@ -553,16 +717,14 @@ class AcLedGuard:
                 ac = f.read().strip() == "1"
         except OSError:
             return
-        if self.last_ac is not None and ac != self.last_ac:
+        if self.last_ac is None:
+            if not ac:
+                self._turn_off_for_battery("离电(初始)")
+        elif ac != self.last_ac:
             if ac:
-                kbd_set(brightness=load_state().get("kbd_restore", 100))
-                log("插电: 恢复背光")
+                self._restore_for_ac()
             else:
-                cur = read_text(f"{LED_DIR}/brightness")
-                if cur and cur.isdigit():
-                    state_update(kbd_restore=int(cur))
-                kbd_set(brightness=0)
-                log("离电: 关闭背光")
+                self._turn_off_for_battery("离电")
         self.last_ac = ac
 
 
@@ -754,7 +916,6 @@ class Calibrator(threading.Thread):
         orig = get_profile()
         procs, result = [], {}
         try:
-            apply_cpu_boost(True)       # 静音档联动会关睿频, 测功耗墙时必须打开, 否则高档测不到上限
             for i, prof in enumerate(PROFILE_BITS):
                 self.state["step"] = f"{prof} {i + 1}/{len(PROFILE_BITS)}"
                 if not set_profile(prof, link=False).get("ok"):
@@ -787,7 +948,6 @@ class Calibrator(threading.Thread):
                 p.kill()
             if orig in PROFILE_BITS:
                 set_profile(orig, link=False)
-                apply_cpu_boost(PROFILE_ACTIONS[orig].get("cpu_boost", True))
             self.state.update(running=False, step="完成" if not self.state["error"] else "失败")
 
 
@@ -830,9 +990,9 @@ def status():
         "fan_boost_ec": guard.ec_boost,
         "fan_guard": guard.guard,
         "overheat_guard": guard.auto_active,
-        "kbd_rgb": read_text(f"{LED_DIR}/multi_intensity"),
-        "kbd_brightness": read_text(f"{LED_DIR}/brightness"),
-        "kbd_rainbow": read_text(f"{INOU_DIR}/rainbow_animation") == "1",
+        "kbd_rgb": " ".join(str(x) for x in (_kbd_live.get("rgb") or [120, 200, 160])),
+        "kbd_brightness": str(0 if _kbd_live.get("effect") == "off" else _kbd_live.get("brightness", 80)),
+        "kbd_rainbow": _kbd_live.get("effect") == "rainbow",
         "toggles": {n: read_text(f"{INOU_DIR}/{n}") == "1" for n in TOGGLES
                     if os.path.exists(f"{INOU_DIR}/{n}")},
         "battery": battery_info(),
@@ -898,6 +1058,8 @@ def handle_cmd(cmd):
         enable = bool(cmd.get("value"))
         state_update(ac_led_off=enable)
         ac_led_guard.enabled = enable
+        ac_led_guard.last_ac = None
+        ac_led_guard.poll()
         return {"ok": True, "ac_led_off": enable}
     return {"ok": False, "error": f"未知操作 {op}"}
 
@@ -994,6 +1156,51 @@ def ac_poll_loop():
         time.sleep(10)
 
 
+def _restore_extras():
+    st = load_state()
+    # 充电上限
+    cl = st.get('charge_limit')
+    if cl and isinstance(cl, int) and 20 <= cl <= 100:
+        try:
+            r = set_charge_limit(cl)
+            log(f'开机恢复充电上限 {cl}%: {r.get("ok")}')
+        except Exception as e:
+            log(f'WARN 恢复充电上限: {e}')
+    # INOU 平台小开关 (fn_lock / super_key_enable / breathing_in_suspend / touchpad_toggle_enable)
+    saved_toggles = st.get('toggles')
+    if isinstance(saved_toggles, dict) and saved_toggles:
+        for t_name, t_val in saved_toggles.items():
+            if t_name in TOGGLES and os.path.exists(f"{INOU_DIR}/{t_name}"):
+                try:
+                    r = toggle_sysfs(t_name, bool(t_val), persist=False)
+                    log(f'开机恢复开关 {t_name}={bool(t_val)}: {r.get("ok")}')
+                except Exception as e:
+                    log(f'WARN 恢复开关 {t_name}: {e}')
+    else:
+        cur_toggles = {n: read_text(f"{INOU_DIR}/{n}") == "1" for n in TOGGLES
+                       if os.path.exists(f"{INOU_DIR}/{n}")}
+        if cur_toggles:
+            state_update(toggles=cur_toggles)
+    # 键盘灯: 亮度/颜色/灯效
+    try:
+        kv = {}
+        eff = st.get('kbd_effect')
+        if st.get('kbd_rgb'):
+            kv['rgb'] = st['kbd_rgb']
+        if eff == 'off':
+            kv['effect'] = 'off'
+            kv['brightness'] = 0
+        else:
+            if eff:
+                kv['effect'] = eff
+            if st.get('kbd_brightness') is not None:
+                kv['brightness'] = st['kbd_brightness']
+        if kv:
+            r = kbd_set(**kv, persist=False)
+            log(f'开机恢复键盘灯: {r}')
+    except Exception as e:
+        log(f'WARN 恢复键盘灯: {e}')
+
 def restore_on_boot():
     st = load_state()
     time.sleep(3)
@@ -1003,6 +1210,9 @@ def restore_on_boot():
         log(f"开机恢复性能模式 {prof}: {r.get('ok')}")
     if st.get("fan_curve"):
         state_update(fan_curve=None)     # 旧版用户态曲线的残留状态
+    _restore_extras()
+    if ac_led_guard:
+        ac_led_guard.poll()
 
 
 def main():
@@ -1021,6 +1231,13 @@ def main():
 
     guard = ThermalGuard()
     ac_led_guard = AcLedGuard()
+    st_init = load_state()
+    if st_init.get("kbd_rgb"):
+        _kbd_live["rgb"] = list(st_init["kbd_rgb"])
+    if st_init.get("kbd_effect"):
+        _kbd_live["effect"] = st_init["kbd_effect"]
+    if st_init.get("kbd_brightness") is not None:
+        _kbd_live["brightness"] = 0 if _kbd_live["effect"] == "off" else int(st_init["kbd_brightness"])
 
     def on_term(sig, frame):
         log(f"收到信号 {sig}, 收尾...")

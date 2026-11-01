@@ -6,15 +6,18 @@
   - 识别型号再选档案 (DetectNvidiaGpuName -> DetectProfile), 档案只放实机验证过的数值
   - 高风险功能加硬门槛 (设备 ID / 驱动版本 / 结构校验), 这里对应 DSDT 方法存在性与 EC 平台代际
   - 可调范围和基线在运行时回读 (Pstates20 范围 / 动态 OEM 基线), 这里对应 EC 实时平台参数与本机校准
-  - 没有证据的值不外推: 未知机型不套用任何功耗墙数值
+  - 没有证据的值不外推: 未知机型不套用任何功耗数值
 """
 
 import json
 import os
 import time
 
-MODELS_PATHS = ("/usr/share/mrv-ctl/models.json",
-                os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "models.json"))
+MODELS_PATHS = (
+    "/usr/share/mrv-ctl/models.json",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "models.json"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "models.json"),
+)
 CALIB_FILE = "/var/lib/mrvd/calibration.json"
 DSDT = "/sys/firmware/acpi/tables/DSDT"
 # 功能所依赖的 ACPI 方法; DSDT 里有这个名字才开放对应功能
